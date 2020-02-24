@@ -72,6 +72,7 @@ import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Hbck;
+import org.apache.hadoop.hbase.client.MasterRegistry;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
@@ -343,18 +344,6 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
   }
 
   /**
-   * @deprecated since 2.0.0 and will be removed in 3.0.0. Use
-   *   {@link #HBaseTestingUtility(Configuration)} instead.
-   * @return a normal HBaseTestingUtility
-   * @see #HBaseTestingUtility(Configuration)
-   * @see <a href="https://issues.apache.org/jira/browse/HBASE-19841">HBASE-19841</a>
-   */
-  @Deprecated
-  public static HBaseTestingUtility createLocalHTU(Configuration c) {
-    return new HBaseTestingUtility(c);
-  }
-
-  /**
    * Close both the region {@code r} and it's underlying WAL. For use in tests.
    */
   public static void closeRegionAndWAL(final Region r) throws IOException {
@@ -401,9 +390,9 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
    * value unintentionally -- but not anything can do about it at moment;
    * single instance only is how the minidfscluster works.
    *
-   * We also create the underlying directory for
+   * We also create the underlying directory names for
    *  hadoop.log.dir, mapreduce.cluster.local.dir and hadoop.tmp.dir, and set the values
-   *  in the conf, and as a system property for hadoop.tmp.dir
+   *  in the conf, and as a system property for hadoop.tmp.dir (We do not create them!).
    *
    * @return The calculated data test build directory, if newly-created.
    */
@@ -1092,8 +1081,11 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
     Configuration c = new Configuration(this.conf);
     TraceUtil.initTracer(c);
     this.hbaseCluster =
-        new MiniHBaseCluster(c, option.getNumMasters(), option.getNumRegionServers(),
-            option.getRsPorts(), option.getMasterClass(), option.getRsClass());
+        new MiniHBaseCluster(c, option.getNumMasters(), option.getNumAlwaysStandByMasters(),
+            option.getNumRegionServers(), option.getRsPorts(), option.getMasterClass(),
+            option.getRsClass());
+    // Populate the master address configuration from mini cluster configuration.
+    conf.set(HConstants.MASTER_ADDRS_KEY, MasterRegistry.getMasterAddr(c));
     // Don't leave here till we've done a successful scan of the hbase:meta
     Table t = getConnection().getTable(TableName.META_TABLE_NAME);
     ResultScanner s = t.getScanner(new Scan());
@@ -1206,6 +1198,7 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
     StartMiniClusterOption option =
         StartMiniClusterOption.builder().numRegionServers(servers).rsPorts(ports).build();
     restartHBaseCluster(option);
+    invalidateConnection();
   }
 
   public void restartHBaseCluster(StartMiniClusterOption option)
@@ -1219,8 +1212,9 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
       this.asyncConnection = null;
     }
     this.hbaseCluster =
-        new MiniHBaseCluster(this.conf, option.getNumMasters(), option.getNumRegionServers(),
-            option.getRsPorts(), option.getMasterClass(), option.getRsClass());
+        new MiniHBaseCluster(this.conf, option.getNumMasters(), option.getNumAlwaysStandByMasters(),
+            option.getNumRegionServers(), option.getRsPorts(), option.getMasterClass(),
+            option.getRsClass());
     // Don't leave here till we've done a successful scan of the hbase:meta
     Connection conn = ConnectionFactory.createConnection(this.conf);
     Table t = conn.getTable(TableName.META_TABLE_NAME);
@@ -2979,6 +2973,26 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
   private void initConnection() throws IOException {
     User user = UserProvider.instantiate(conf).getCurrent();
     this.asyncConnection = ClusterConnectionFactory.createAsyncClusterConnection(conf, null, user);
+  }
+
+  /**
+   * Resets the connections so that the next time getConnection() is called, a new connection is
+   * created. This is needed in cases where the entire cluster / all the masters are shutdown and
+   * the connection is not valid anymore.
+   * TODO: There should be a more coherent way of doing this. Unfortunately the way tests are
+   *   written, not all start() stop() calls go through this class. Most tests directly operate on
+   *   the underlying mini/local hbase cluster. That makes it difficult for this wrapper class to
+   *   maintain the connection state automatically. Cleaning this is a much bigger refactor.
+   */
+  public void invalidateConnection() throws IOException {
+    closeConnection();
+    // Update the master addresses if they changed.
+    final String masterConfigBefore = conf.get(HConstants.MASTER_ADDRS_KEY);
+    final String masterConfAfter = getMiniHBaseCluster().conf.get(HConstants.MASTER_ADDRS_KEY);
+    LOG.info("Invalidated connection. Updating master addresses before: {} after: {}",
+        masterConfigBefore, masterConfAfter);
+    conf.set(HConstants.MASTER_ADDRS_KEY,
+        getMiniHBaseCluster().conf.get(HConstants.MASTER_ADDRS_KEY));
   }
 
   /**
